@@ -114,6 +114,13 @@ jobs:
         run: |
           cd kernel_workspace/kernel_platform
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
+          # BakaSU Kbuild требует .git рядом с исходником; в bazel-песочнице .git нет.
+          # 1) отключаем проверку submodule, 2) добавляем fallback для версии
+          sed -i 's|^LOCAL_GIT_EXISTS := .*|LOCAL_GIT_EXISTS := 1|' KernelSU/kernel/Kbuild
+          sed -i 's|rev-list --count HEAD)|rev-list --count HEAD 2>/dev/null || echo 0)|' KernelSU/kernel/Kbuild
+          grep -q "LOCAL_GIT_EXISTS := 1" KernelSU/kernel/Kbuild || { echo "::error:: Kbuild submodule-check patch failed"; exit 1; }
+          grep -q "rev-list --count HEAD 2>/dev/null" KernelSU/kernel/Kbuild || { echo "::error:: Kbuild version fallback patch failed"; exit 1; }
+          echo "BakaSU Kbuild patched for bazel sandbox"
           cd KernelSU
           KSU_VERSION=$(expr $(git rev-list --count main 2>/dev/null || git rev-list --count HEAD) + 30700 2>/dev/null || echo 114514)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
@@ -156,7 +163,6 @@ jobs:
         if: inputs.bbr
         run: |
           cd kernel_workspace/kernel_platform/common
-          # sysctl-helper-патчи пропускаем: в 6.1 всё есть, они портят sysctl.c
           grep -q "proc_dou8vec_minmax" include/linux/sysctl.h || { echo "::error:: proc_dou8vec_minmax missing"; exit 1; }
           patch -p1 -F 3 --no-backup-if-mismatch < ../../wild_patches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android14-6.1.patch
 
@@ -246,7 +252,6 @@ jobs:
         run: |
           cd kernel_workspace/kernel_platform/common
           curl -LSs "https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh" | bash
-          # правим Kconfig-дефолт CONFIG_LSM: добавляем baseband_guard после selinux
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           grep -q "baseband_guard" security/Kconfig || { echo "::error:: BBG LSM sed failed"; exit 1; }
           echo "BBG integrated, Kconfig LSM default patched"
@@ -282,7 +287,6 @@ jobs:
             add "CONFIG_KSU_SUSFS=n"
           fi
 
-          # Mountify / метамодули
           add "CONFIG_TMPFS_XATTR=y"
           add "CONFIG_TMPFS_POSIX_ACL=y"
 
