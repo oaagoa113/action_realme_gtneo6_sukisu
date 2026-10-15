@@ -222,8 +222,16 @@ jobs:
           BASE="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8650/main/zram_patch"
           curl -LSs "$BASE/001-lz4.patch" -o lz4.patch
           curl -LSs "$BASE/002-zstd.patch" -o zstd.patch
-          patch -p1 -F 3 --no-backup-if-mismatch < lz4.patch
-          patch -p1 -F 3 --no-backup-if-mismatch < zstd.patch
+          if git apply --check lz4.patch 2>/dev/null; then
+            git apply lz4.patch
+          else
+            patch -p1 -F 3 --no-backup-if-mismatch < lz4.patch
+          fi
+          if git apply --check zstd.patch 2>/dev/null; then
+            git apply zstd.patch
+          else
+            patch -p1 -F 3 --no-backup-if-mismatch < zstd.patch
+          fi
           if find . -name '*.rej' | grep -q .; then
             echo "::error:: zram patches produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
           fi
