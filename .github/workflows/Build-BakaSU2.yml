@@ -195,7 +195,6 @@ jobs:
           else
             patch -p1 -F 3 --no-backup-if-mismatch < ../../cctv_patch/other_patch/cve-2026-43499-rtmutex-6.1.patch
           fi
-          # Патч cctv18 содержит ОБЕ части фикса (GhostLock + регрессия). Проверяем все три признака:
           grep -q "waiter_task = waiter->task" kernel/locking/rtmutex.c || { echo "::error:: rtmutex: waiter_task не найден"; exit 1; }
           grep -q "if (!waiter_task)" kernel/locking/rtmutex.c || { echo "::error:: rtmutex: guard !waiter_task не найден"; exit 1; }
           grep -q "if (unlikely(ret < 0))" kernel/locking/rtmutex_api.c || { echo "::error:: rtmutex: ret < 0 не найден"; exit 1; }
@@ -285,7 +284,6 @@ jobs:
             add "CONFIG_TCP_CONG_CUBIC=y"
             add "CONFIG_TCP_CONG_BBR=y"
             add "CONFIG_TCP_CONG_BBR3=y"
-            # =y вместо модулей: иначе Bazel падает на необъявленных .ko
             add "CONFIG_TCP_CONG_HTCP=y"
             add "CONFIG_TCP_CONG_BIC=y"
             add "CONFIG_TCP_CONG_WESTWOOD=y"
@@ -375,7 +373,8 @@ jobs:
 
       - name: Make AnyKernel3
         run: |
-          git clone https://github.com/Kernel-SU/AnyKernel3 --depth=1
+          # Проверенный на OPPO/Realme AK3 — форк cctv18 (то, чем пользуются его сборки)
+          git clone https://github.com/cctv18/AnyKernel3 --depth=1
           rm -rf ./AnyKernel3/.git
           cp ${{ env.DIST }}/Image ./AnyKernel3/Image
           cp ${{ env.DIST }}/Image ./kernel_workspace/kernel
