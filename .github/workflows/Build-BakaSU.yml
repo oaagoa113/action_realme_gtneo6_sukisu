@@ -19,10 +19,6 @@ on:
         description: 'KPM (встроенный KernelPatch-модульный движок)'
         type: boolean
         default: true
-      rtmutex_fix2_url:
-        description: 'URL доп. фикса регрессии CVE-2026-53163'
-        type: string
-        default: 'https://github.com/torvalds/linux/commit/40a25d59e85b.patch'
 
 env:
   RETENTION_COUNT: 5
@@ -147,24 +143,17 @@ jobs:
       - name: Apply BBRv3 backport
         run: |
           cd kernel_workspace/kernel_platform/common
-          BASE="https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/bbrv3"
-          for p in sysctl_add_proc_dou8vec_minmax.patch sysctl_fix_data-races_in_proc_dou8vec_minmax.patch; do
-            curl -LSs "$BASE/$p" -o "$p"
-            if patch -p1 -R --dry-run -f < "$p" >/dev/null 2>&1; then
-              echo "$p fully applied already, skipping"
-            else
-              patch -p1 -F 3 --no-backup-if-mismatch < "$p" || true
-              find . -name '*.rej' -delete
-            fi
-          done
+          # ВАЖНО: sysctl-helper-патчи НЕ применяем — в 6.1 всё уже есть,
+          # их применение портит kernel/sysctl.c (проверено на логах)
           grep -q "proc_dou8vec_minmax" include/linux/sysctl.h || { echo "::error:: proc_dou8vec_minmax missing"; exit 1; }
+          BASE="https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/bbrv3"
           curl -LSs "$BASE/0001-net-tcp-backport-BBRv3-to-android14-6.1.patch" -o bbrv3.patch
           patch -p1 -F 3 --no-backup-if-mismatch < bbrv3.patch
           if find . -name '*.rej' | grep -q .; then
             echo "::error:: BBRv3 produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
           fi
 
-      - name: Apply rtmutex fix (CVE-2026-43499 GhostLock)
+      - name: Apply rtmutex fix (CVE-2026-43499 GhostLock + регрессия 53163)
         run: |
           cd kernel_workspace/kernel_platform/common
           curl -LSs "https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8650/main/other_patch/cve-2026-43499-rtmutex-6.1.patch" -o rtmutex.patch
@@ -173,20 +162,38 @@ jobs:
           else
             patch -p1 -F 3 --no-backup-if-mismatch < rtmutex.patch
             if find . -name '*.rej' | grep -q .; then
-              echo "::error:: rtmutex patch produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+              echo "::error:: rtmutex fix1 produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
             fi
-            grep -q "waiter->task" kernel/locking/rtmutex.c || { echo "::error:: rtmutex verify failed"; exit 1; }
-            echo "rtmutex fix verified"
           fi
-          if [ -n "${{ inputs.rtmutex_fix2_url }}" ]; then
-            curl -LSs "${{ inputs.rtmutex_fix2_url }}" -o rtmutex_fix2.patch
-            if patch -p1 -R --dry-run -f < rtmutex_fix2.patch >/dev/null 2>&1; then
-              echo "rtmutex fix2 already present, skipping"
-            else
-              patch -p1 -F 3 --no-backup-if-mismatch < rtmutex_fix2.patch || true
-              find . -name '*.rej' -delete
-              echo "::warning:: rtmutex fix2 applied tolerantly (mainline patch on 6.1), verify in build"
-            fi
+          grep -q "waiter->task" kernel/locking/rtmutex.c || { echo "::error:: rtmutex fix1 verify failed"; exit 1; }
+          echo "rtmutex fix1 verified"
+          # Фикс регрессии CVE-2026-53163 (guard + ret < 0) уже внутри патча cctv18,
+          # но на случай другого дерева — проверяем и добавляем недостающее
+          if grep -q "if (!waiter->task)" kernel/locking/rtmutex.c; then
+            echo "rtmutex fix2 guard present"
+          else
+            awk '
+              /^static void __sched remove_waiter\(struct rt_mutex_base \*lock,$/ {inrw=1}
+              inrw && /^lockdep_assert_held\(&lock->wait_lock\);$/ {
+                print
+                print ""
+                print "\tif (!waiter->task)"
+                print "\t\treturn;"
+                inrw=0
+                next
+              }
+              {print}
+            ' kernel/locking/rtmutex.c > rtmutex_new.c
+            mv rtmutex_new.c kernel/locking/rtmutex.c
+            grep -q "if (!waiter->task)" kernel/locking/rtmutex.c || { echo "::error:: fix2 guard insert failed"; exit 1; }
+            echo "rtmutex fix2 guard inserted"
+          fi
+          if grep -q "if (unlikely(ret < 0))" kernel/locking/rtmutex_api.c; then
+            echo "rtmutex fix2 proxy_lock present"
+          else
+            sed -i 's/if (unlikely(ret))$/if (unlikely(ret < 0))/' kernel/locking/rtmutex_api.c
+            grep -q "if (unlikely(ret < 0))" kernel/locking/rtmutex_api.c || { echo "::error:: fix2 proxy_lock edit failed"; exit 1; }
+            echo "rtmutex fix2 proxy_lock fixed"
           fi
 
       - name: Apply IPv6 NAT vintf hide patch
@@ -286,10 +293,20 @@ jobs:
           if [ "${{ inputs.vpnhide }}" = "true" ]; then
             add_cfg "CONFIG_VPNHIDE=y"
           fi
-          if grep -rqs "config BBG" security/; then
+
+          if [ -e common/security/baseband-guard ] && grep -rqs "config BBG" common/security/; then
             add_cfg "CONFIG_BBG=y"
+            if grep -q '^CONFIG_LSM=' "$DEFCFG"; then
+              if ! grep -q 'baseband_guard' "$DEFCFG"; then
+                sed -i 's/^\(CONFIG_LSM="[^"]*\)"$/\1,baseband_guard"/' "$DEFCFG"
+                echo "BBG appended to CONFIG_LSM"
+              fi
+            else
+              add_cfg 'CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,bpf,baseband_guard"'
+              echo "CONFIG_LSM set with baseband_guard"
+            fi
           else
-            echo "::warning:: BBG Kconfig symbol not found, CONFIG_BBG not added"
+            echo "::warning:: BBG not integrated, skipping"
           fi
 
           sed -i 's/check_defconfig//' ./common/build.config.gki
