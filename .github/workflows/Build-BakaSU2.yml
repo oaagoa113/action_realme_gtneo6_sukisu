@@ -115,24 +115,19 @@ jobs:
           cd kernel_workspace/kernel_platform
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
           cd KernelSU
-          # susfs-синхронизация BakaSU живёт в ветке sync-susfs (sync for latest susfs, co-authored by simonpunk)
           git fetch --depth=100 origin sync-susfs
           git checkout origin/sync-susfs
           echo "BakaSU on sync-susfs branch (HEAD: $(git rev-parse --short HEAD))"
-          # Патчи для bazel-песочницы (условно — применяем только если паттерн есть):
-          # 1) проверка submodule (.git в песочнице нет)
           if grep -q "^LOCAL_GIT_EXISTS :=" kernel/Kbuild; then
             sed -i 's|^LOCAL_GIT_EXISTS := .*|LOCAL_GIT_EXISTS := 1|' kernel/Kbuild
             grep -q "LOCAL_GIT_EXISTS := 1" kernel/Kbuild || { echo "::error:: Kbuild submodule-check patch failed"; exit 1; }
             echo "Kbuild submodule check disabled"
           fi
-          # 2) fallback версии (git в песочнице молчит)
           if grep -q "rev-list --count HEAD)" kernel/Kbuild; then
             sed -i 's#rev-list --count HEAD)#rev-list --count HEAD 2>/dev/null || echo 0)#' kernel/Kbuild
             grep -q "rev-list --count HEAD 2>/dev/null" kernel/Kbuild || { echo "::error:: Kbuild version fallback patch failed"; exit 1; }
             echo "Kbuild version fallback added"
           fi
-          # 3) стоп-кран susfs — в sync-susfs снят автором; страховочно снимаем и сами, если вдруг остался
           if grep -q "Please wait susfs update" kernel/tools/susfs_compat.mk 2>/dev/null; then
             sed -i '/Please wait susfs update/d' kernel/tools/susfs_compat.mk
             grep -q "Please wait susfs update" kernel/tools/susfs_compat.mk && { echo "::error:: susfs stop-crane not removed"; exit 1; }
@@ -356,6 +351,8 @@ jobs:
 
       - name: Build kernel
         run: |
+          # Показывать полный вывод упавших действий Bazel (иначе ошибку компиляции не видно)
+          echo "common --verbose_failures" >> $HOME/.bazelrc
           cd kernel_workspace
           export KSU_VERSION=${{ env.KSUVER }}
           ./kernel_platform/build_with_bazel.py -t ${{ env.CPUD }} gki --action_env=KSU_VERSION
