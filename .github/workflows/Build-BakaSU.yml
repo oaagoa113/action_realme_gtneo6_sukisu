@@ -143,8 +143,7 @@ jobs:
       - name: Apply BBRv3 backport
         run: |
           cd kernel_workspace/kernel_platform/common
-          # ВАЖНО: sysctl-helper-патчи НЕ применяем — в 6.1 всё уже есть,
-          # их применение портит kernel/sysctl.c (проверено на логах)
+          # sysctl-helper-патчи НЕ применяем — в 6.1 всё уже есть, они портят sysctl.c
           grep -q "proc_dou8vec_minmax" include/linux/sysctl.h || { echo "::error:: proc_dou8vec_minmax missing"; exit 1; }
           BASE="https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/bbrv3"
           curl -LSs "$BASE/0001-net-tcp-backport-BBRv3-to-android14-6.1.patch" -o bbrv3.patch
@@ -156,9 +155,10 @@ jobs:
       - name: Apply rtmutex fix (CVE-2026-43499 GhostLock + регрессия 53163)
         run: |
           cd kernel_workspace/kernel_platform/common
+          # Фикс 1: waiter->task вместо current (бэкпорт cctv18 под 6.1)
           curl -LSs "https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8650/main/other_patch/cve-2026-43499-rtmutex-6.1.patch" -o rtmutex.patch
           if patch -p1 -R --dry-run -f < rtmutex.patch >/dev/null 2>&1; then
-            echo "rtmutex fix already present, skipping"
+            echo "rtmutex fix1 already present, skipping"
           else
             patch -p1 -F 3 --no-backup-if-mismatch < rtmutex.patch
             if find . -name '*.rej' | grep -q .; then
@@ -167,34 +167,47 @@ jobs:
           fi
           grep -q "waiter->task" kernel/locking/rtmutex.c || { echo "::error:: rtmutex fix1 verify failed"; exit 1; }
           echo "rtmutex fix1 verified"
-          # Фикс регрессии CVE-2026-53163 (guard + ret < 0) уже внутри патча cctv18,
-          # но на случай другого дерева — проверяем и добавляем недостающее
-          if grep -q "if (!waiter->task)" kernel/locking/rtmutex.c; then
-            echo "rtmutex fix2 guard present"
-          else
-            awk '
-              /^static void __sched remove_waiter\(struct rt_mutex_base \*lock,$/ {inrw=1}
-              inrw && /^lockdep_assert_held\(&lock->wait_lock\);$/ {
-                print
-                print ""
-                print "\tif (!waiter->task)"
-                print "\t\treturn;"
-                inrw=0
-                next
-              }
-              {print}
-            ' kernel/locking/rtmutex.c > rtmutex_new.c
-            mv rtmutex_new.c kernel/locking/rtmutex.c
-            grep -q "if (!waiter->task)" kernel/locking/rtmutex.c || { echo "::error:: fix2 guard insert failed"; exit 1; }
-            echo "rtmutex fix2 guard inserted"
-          fi
-          if grep -q "if (unlikely(ret < 0))" kernel/locking/rtmutex_api.c; then
-            echo "rtmutex fix2 proxy_lock present"
-          else
-            sed -i 's/if (unlikely(ret))$/if (unlikely(ret < 0))/' kernel/locking/rtmutex_api.c
-            grep -q "if (unlikely(ret < 0))" kernel/locking/rtmutex_api.c || { echo "::error:: fix2 proxy_lock edit failed"; exit 1; }
-            echo "rtmutex fix2 proxy_lock fixed"
-          fi
+          # Фикс 2 (регрессия CVE-2026-53163): точечные правки через Python
+          python3 - <<'PYEOF'
+          import re, sys
+
+          # 2a: guard в remove_waiter — если waiter не заармлен, выходим
+          p = 'kernel/locking/rtmutex.c'
+          src = open(p).read()
+          if 'if (!waiter->task)' in src:
+              print('rtmutex fix2 guard already present')
+          else:
+              m = re.search(r'remove_waiter\(struct rt_mutex_base \*lock,.*?\n\}', src, re.S)
+              if not m:
+                  print('::error:: remove_waiter not found'); sys.exit(1)
+              fn = m.group(0)
+              mm = re.search(r'^(\s*)raw_spin_lock\(&[^\n]*pi_lock\);', fn, re.M)
+              if not mm:
+                  print('::error:: no pi_lock anchor in remove_waiter'); sys.exit(1)
+              ind = mm.group(1)
+              guard = ind + 'if (!waiter->task)\n' + ind + '\treturn;\n\n'
+              newfn = fn[:mm.start()] + guard + fn[mm.start():]
+              src = src[:m.start()] + newfn + src[m.end():]
+              open(p, 'w').write(src)
+              print('rtmutex fix2 guard inserted')
+
+          # 2b: ret < 0 в rt_mutex_start_proxy_lock (ret==1 = захват, не ошибка)
+          p2 = 'kernel/locking/rtmutex_api.c'
+          s2 = open(p2).read()
+          if 'if (unlikely(ret < 0))' in s2:
+              print('rtmutex fix2 proxy_lock already fixed')
+          else:
+              m2 = re.search(r'(?<!_)rt_mutex_start_proxy_lock\(.*?\n\}', s2, re.S)
+              if not m2:
+                  print('::error:: rt_mutex_start_proxy_lock not found'); sys.exit(1)
+              fn2 = m2.group(0)
+              if 'if (unlikely(ret))' not in fn2:
+                  print('::error:: unlikely(ret) anchor missing in proxy_lock'); sys.exit(1)
+              newfn2 = fn2.replace('if (unlikely(ret))', 'if (unlikely(ret < 0))', 1)
+              s2 = s2[:m2.start()] + newfn2 + s2[m2.end():]
+              open(p2, 'w').write(s2)
+              print('rtmutex fix2 proxy_lock fixed')
+          PYEOF
 
       - name: Apply IPv6 NAT vintf hide patch
         run: |
