@@ -1,0 +1,387 @@
+name: Build realmeGTNeo6_Kernel_BakaSU
+
+on:
+  workflow_dispatch:
+    inputs:
+      ntsync:
+        description: 'NTSync (драйвер /dev/ntsync для Wine/Winlator)'
+        type: boolean
+        default: true
+      lz4_zstd:
+        description: 'LZ4 1.10 + ZSTD 1.5.7 (обновление компрессоров zram)'
+        type: boolean
+        default: false
+      vpnhide:
+        description: 'VPNHide (встроенный backend + companion из релизов)'
+        type: boolean
+        default: true
+      kpm:
+        description: 'KPM (встроенный KernelPatch-модульный движок)'
+        type: boolean
+        default: true
+      rtmutex_fix2_url:
+        description: 'URL доп. фикса регрессии CVE-2026-53163 (пусто = пропуск)'
+        type: string
+        default: ''
+
+env:
+  RETENTION_COUNT: 5
+  CPU: 'sm8635'
+  FEIL: 'realme_gt_neo6B'
+  CPUD: 'pineapple'
+  ANDROID_VERSION: 'android14'
+  KERNEL_VERSION: '6.1'
+  KERNEL_NAME: '-android14-BakaSU-bale'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    outputs:
+      ksuver: ${{ steps.bakasu.outputs.ksuver }}
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "MisterZtr"
+          git config --global user.email "andey2004586@gmail.com"
+
+      - name: Install dependencies
+        run: |
+          sudo apt update && sudo apt install -y python3 git curl zip patch
+
+      - name: Install repo tool
+        run: |
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Initialize repo and sync
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          repo init -u https://github.com/realme-pineapple-devs/kernel_manifest.git -b refs/heads/realme/${{ env.CPU }} -m ${{ env.FEIL }}.xml --depth=1
+          repo sync
+          rm kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          sed -i 's/ -dirty//g' kernel_platform/common/scripts/setlocalversion
+          sed -i 's/ -dirty//g' kernel_platform/msm-kernel/scripts/setlocalversion
+          sed -i 's/ -dirty//g' kernel_platform/external/dtc/scripts/setlocalversion
+
+      - name: Add BakaSU
+        id: bakasu
+        run: |
+          cd kernel_workspace/kernel_platform
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
+          cd ./KernelSU
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" 30700)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+          export KSU_VERSION=$KSU_VERSION
+          sed -i "s/DKSU_VERSION=[0-9]*/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+
+      - name: Apply SUSFS patches (susfs4oki)
+        run: |
+          cd kernel_workspace
+          git clone https://github.com/cctv18/susfs4oki.git -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+          git clone https://github.com/ShirkNeko/SukiSU_patch.git
+          cd kernel_platform
+          cp ../susfs4oki/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+          cp ../susfs4oki/kernel_patches/fs/* ./common/fs/
+          cp ../susfs4oki/kernel_patches/include/linux/* ./common/include/linux/
+          cd ./common
+          patch -p1 -F 3 --no-backup-if-mismatch < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error:: SUSFS patch produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+          fi
+
+      - name: Apply 69_hide_stuff patch
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          cp ../../SukiSU_patch/69_hide_stuff.patch ./
+          patch -p1 -F 3 --no-backup-if-mismatch < 69_hide_stuff.patch
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error:: 69_hide_stuff produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+          fi
+
+      - name: Apply Unicode Fix patch
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/unicode_bypass_fix_6.1+.patch" -o unicode_fix.patch
+          patch -p1 -F 3 --no-backup-if-mismatch < unicode_fix.patch
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error:: Unicode fix produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+          fi
+
+      - name: Apply BBRv3 backport
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          BASE="https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/bbrv3"
+          for p in sysctl_add_proc_dou8vec_minmax.patch sysctl_fix_data-races_in_proc_dou8vec_minmax.patch; do
+            curl -LSs "$BASE/$p" -o "$p"
+            if patch -p1 -R --dry-run -f < "$p" >/dev/null 2>&1; then
+              echo "$p already applied, skipping"
+            else
+              patch -p1 -F 3 --no-backup-if-mismatch < "$p"
+            fi
+          done
+          curl -LSs "$BASE/0001-net-tcp-backport-BBRv3-to-android14-6.1.patch" -o bbrv3.patch
+          patch -p1 -F 3 --no-backup-if-mismatch < bbrv3.patch
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error:: BBRv3 produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+          fi
+
+      - name: Apply rtmutex fix (CVE-2026-43499 GhostLock)
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          curl -LSs "https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8650/main/other_patch/cve-2026-43499-rtmutex-6.1.patch" -o rtmutex.patch
+          if patch -p1 -R --dry-run -f < rtmutex.patch >/dev/null 2>&1; then
+            echo "rtmutex fix already present, skipping"
+          else
+            patch -p1 -F 3 --no-backup-if-mismatch < rtmutex.patch
+            if find . -name '*.rej' | grep -q .; then
+              echo "::error:: rtmutex patch produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+            fi
+            grep -q "waiter->task" kernel/locking/rtmutex.c || { echo "::error:: rtmutex verify failed"; exit 1; }
+            echo "rtmutex fix verified"
+          fi
+          if [ -n "${{ inputs.rtmutex_fix2_url }}" ]; then
+            curl -LSs "${{ inputs.rtmutex_fix2_url }}" -o rtmutex_fix2.patch
+            if patch -p1 -R --dry-run -f < rtmutex_fix2.patch >/dev/null 2>&1; then
+              echo "rtmutex fix2 already present, skipping"
+            else
+              patch -p1 -F 3 --no-backup-if-mismatch < rtmutex_fix2.patch
+              if find . -name '*.rej' | grep -q .; then
+                echo "::error:: rtmutex fix2 produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+              fi
+            fi
+          fi
+
+      - name: Apply IPv6 NAT vintf hide patch
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/IPv6_NAT_FIX.patch" -o ipv6_nat_fix.patch
+          if patch -p1 -R --dry-run -f < ipv6_nat_fix.patch >/dev/null 2>&1; then
+            echo "IPv6_NAT_FIX already applied, skipping"
+          else
+            patch -p1 -F 3 --no-backup-if-mismatch < ipv6_nat_fix.patch
+            if find . -name '*.rej' | grep -q .; then
+              echo "::error:: IPv6_NAT_FIX produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+            fi
+          fi
+
+      - name: Apply NTSync patches
+        if: ${{ inputs.ntsync == true }}
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          BASE="https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync"
+          curl -LSs "$BASE/ntsync_base.patch" -o ntsync_base.patch
+          curl -LSs "$BASE/ntsync_compat_android14-6.1.patch" -o ntsync_compat.patch
+          patch -p1 -F 3 --no-backup-if-mismatch < ntsync_base.patch
+          patch -p1 -F 3 --no-backup-if-mismatch < ntsync_compat.patch
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error:: NTSync produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+          fi
+
+      - name: Apply LZ4+ZSTD zram patches
+        if: ${{ inputs.lz4_zstd == true }}
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          BASE="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8650/main/zram_patch"
+          curl -LSs "$BASE/001-lz4.patch" -o lz4.patch
+          curl -LSs "$BASE/002-zstd.patch" -o zstd.patch
+          patch -p1 -F 3 --no-backup-if-mismatch < lz4.patch
+          patch -p1 -F 3 --no-backup-if-mismatch < zstd.patch
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error:: zram patches produced rejects"; find . -name '*.rej' -exec cat {} \; ; exit 1
+          fi
+
+      - name: Integrate Baseband Guard
+        run: |
+          cd kernel_workspace/kernel_platform
+          curl -LSs "https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh" | bash
+
+      - name: Integrate VPNHide (builtin in-tree backend)
+        if: ${{ inputs.vpnhide == true }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com/okhsunrog/vpnhide.git
+          cd kernel_workspace/kernel_platform/common
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run --python 3.12 $GITHUB_WORKSPACE/vpnhide/builtin/scripts/integrate.py apply \
+            --kernel . \
+            --kmi android14-6.1 \
+            --output $GITHUB_WORKSPACE/vpnhide-review
+          test -f security/vpnhide/core.c || { echo "::error:: VPNHide driver missing"; exit 1; }
+          grep -q "vpnhide" security/Makefile || { echo "::error:: VPNHide wiring missing"; exit 1; }
+          echo "VPNHide in-tree backend integrated"
+
+      - name: Add kernel configuration
+        run: |
+          cd kernel_workspace/kernel_platform
+          DEFCFG=./common/arch/arm64/configs/gki_defconfig
+          add_cfg() { grep -qx "$1" "$DEFCFG" || echo "$1" >> "$DEFCFG"; }
+
+          # KSU + SUSFS
+          add_cfg "CONFIG_KSU=y"
+          add_cfg "CONFIG_KSU_SUSFS=y"
+          add_cfg "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+          add_cfg "CONFIG_KSU_SUSFS_SUS_PATH=y"
+          add_cfg "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+          add_cfg "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+          add_cfg "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+          add_cfg "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+          add_cfg "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n"
+          add_cfg "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+          add_cfg "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+          add_cfg "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+          add_cfg "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+          add_cfg "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+          add_cfg "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+          add_cfg "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+          add_cfg "CONFIG_KSU_SUSFS_SUS_MAP=y"
+
+          # Mountify / метамодули
+          add_cfg "CONFIG_TMPFS_XATTR=y"
+          add_cfg "CONFIG_TMPFS_POSIX_ACL=y"
+
+          # BBRv3 (дефолт остаётся cubic)
+          add_cfg "CONFIG_TCP_CONG_BBR3=y"
+
+          # IPSET + IPv6 NAT + TTL/HL
+          add_cfg "CONFIG_IP_SET=y"
+          add_cfg "CONFIG_IP_SET_HASH_IP=y"
+          add_cfg "CONFIG_IP_SET_HASH_IPPORT=y"
+          add_cfg "CONFIG_IP_SET_HASH_IPPORTIP=y"
+          add_cfg "CONFIG_IP_SET_HASH_IPPORTNET=y"
+          add_cfg "CONFIG_IP_SET_HASH_NET=y"
+          add_cfg "CONFIG_IP_SET_HASH_NETPORT=y"
+          add_cfg "CONFIG_IP_SET_LIST_SET=y"
+          add_cfg "CONFIG_NETFILTER_XT_SET=y"
+          add_cfg "CONFIG_NETFILTER_XT_TARGET_TTL=y"
+          add_cfg "CONFIG_NETFILTER_XT_TARGET_HL=y"
+          add_cfg "CONFIG_IP6_NF_IPTABLES=y"
+          add_cfg "CONFIG_IP6_NF_MANGLE=y"
+          add_cfg "CONFIG_IP6_NF_NAT=y"
+
+          # NTSync
+          if [ "${{ inputs.ntsync }}" = "true" ]; then
+            add_cfg "CONFIG_NTSYNC=y"
+          fi
+
+          # VPNHide
+          if [ "${{ inputs.vpnhide }}" = "true" ]; then
+            add_cfg "CONFIG_VPNHIDE=y"
+          fi
+
+          # BBG (символ появляется после setup.sh)
+          if grep -rqs "config BBG" security/; then
+            add_cfg "CONFIG_BBG=y"
+          else
+            echo "::warning:: BBG Kconfig symbol not found, CONFIG_BBG not added"
+          fi
+
+          # Remove check_defconfig
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+
+      - name: Add make name
+        run: |
+          cd kernel_workspace/kernel_platform
+          if [[ "${{ env.KERNEL_VERSION }}" == "6.1" || "${{ env.KERNEL_VERSION }}" == "6.6" ]]; then
+            sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+          fi
+          sed -i '$s|echo "\$res"|echo "\${{ env.KERNEL_NAME }}"|' ./common/scripts/setlocalversion
+
+      - name: Build kernel
+        run: |
+          cd kernel_workspace
+          if [[ "${{ env.KERNEL_VERSION }}" == "6.1" || "${{ env.KERNEL_VERSION }}" == "6.6" ]]; then
+            ./kernel_platform/build_with_bazel.py -t ${{ env.CPUD }} gki --action_env=KSU_VERSION
+          else
+            LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ env.CPUD }} gki
+          fi
+
+      - name: Make AnyKernel3
+        run: |
+          git clone https://github.com/Kernel-SU/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
+          dir1="./kernel_workspace/kernel_platform/out/msm-kernel-${{ env.CPUD }}-gki/dist/"
+          dir2="./kernel_workspace/kernel_platform/common/out/arch/arm64/boot/"
+          dir3="./kernel_workspace/kernel_platform/out/msm-${{ env.CPUD }}-${{ env.CPUD }}-gki/dist/"
+          target1="./AnyKernel3/"
+
+          if find "$dir1" -name "Image" | grep -q "Image"; then
+            image_path="$dir1"Image
+          elif find "$dir2" -name "Image" | grep -q "Image"; then
+            image_path="$dir2"Image
+          elif find "$dir3" -name "Image" | grep -q "Image"; then
+            image_path="$dir3"Image
+          else
+            image_path=$(find "./kernel_workspace/kernel_platform/common/out/" -name "Image" | head -n 1)
+          fi
+
+          if [ -n "$image_path" ] && [ -f "$image_path" ]; then
+            mkdir -p "$dir1"
+            if [ "$(realpath "$image_path")" != "$(realpath "$dir1"Image)" ]; then
+              cp "$image_path" "$dir1"
+            fi
+          else
+            echo "Image not found, build failed"
+            exit 1
+          fi
+
+      - name: Apply patch_linux (KPM) and replace Image
+        if: ${{ inputs.kpm == true }}
+        run: |
+          cd kernel_workspace/kernel_platform/out/msm-kernel-${{ env.CPUD }}-gki/dist
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/main/kpm/patch_linux" -o patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          rm -f Image
+          mv oImage Image
+          cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
+          cp Image $GITHUB_WORKSPACE/kernel_workspace/kernel
+
+      - name: Copy Image without KPM
+        if: ${{ inputs.kpm == false }}
+        run: |
+          cd kernel_workspace/kernel_platform/out/msm-kernel-${{ env.CPUD }}-gki/dist
+          cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
+          cp Image $GITHUB_WORKSPACE/kernel_workspace/kernel
+
+      - name: Download VPNHide companion module
+        if: ${{ inputs.vpnhide == true }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          gh release download --repo okhsunrog/vpnhide --pattern '*builtin*.zip' --dir . \
+            || curl -s https://api.github.com/repos/okhsunrog/vpnhide/releases/latest \
+                 | grep browser_download_url | grep -i builtin | cut -d '"' -f 4 | xargs -I{} curl -LO {} \
+            || echo "::warning:: vpnhide-builtin.zip not found in releases"
+          ls -la *.zip || true
+
+      - name: Package artifact
+        run: |
+          cd $GITHUB_WORKSPACE/AnyKernel3
+          zip -r ../AnyKernel3_BakaSU_${{ env.KSUVER }}_${{ env.FEIL }}.zip ./*
+          cd ..
+          cd $GITHUB_WORKSPACE/kernel_workspace
+          zip -r ../Image_BakaSU_${{ env.KSUVER }}_${{ env.FEIL }}.zip ./kernel
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BakaSU_Kernel_ZIP_Artifacts
+          path: |
+            *.zip
+          retention-days: 1
