@@ -16,7 +16,7 @@ on:
         type: boolean
         default: true
       bbr:
-        description: 'BBRv3 как доступный алгоритм (дефолт cubic)'
+        description: 'BBR1 + BBRv3 как доступные алгоритмы (дефолт cubic)'
         type: boolean
         default: true
       lz4zstd:
@@ -32,7 +32,7 @@ on:
         type: boolean
         default: true
       rtmutex_fix:
-        description: 'Фикс CVE-2026-43499 GhostLock (+ регрессия, уже внутри патча)'
+        description: 'Фикс CVE-2026-43499 GhostLock (+ регрессия, внутри патча)'
         type: boolean
         default: true
       unicode_fix:
@@ -191,48 +191,15 @@ jobs:
         run: |
           cd kernel_workspace/kernel_platform/common
           if patch -p1 -R --dry-run -f < ../../cctv_patch/other_patch/cve-2026-43499-rtmutex-6.1.patch >/dev/null 2>&1; then
-            echo "rtmutex fix1 already present, skipping"
+            echo "rtmutex fix already present, skipping"
           else
             patch -p1 -F 3 --no-backup-if-mismatch < ../../cctv_patch/other_patch/cve-2026-43499-rtmutex-6.1.patch
           fi
-          grep -q "waiter->task" kernel/locking/rtmutex.c || { echo "::error:: rtmutex fix1 verify failed"; exit 1; }
-          echo "rtmutex fix1 verified"
-          python3 - <<'PYEOF'
-          import re, sys
-          p = 'kernel/locking/rtmutex.c'
-          src = open(p).read()
-          if 'if (!waiter->task)' in src:
-              print('rtmutex fix2 guard already present')
-          else:
-              m = re.search(r'remove_waiter\(struct rt_mutex_base \*lock,.*?\n\}', src, re.S)
-              if not m:
-                  print('::error:: remove_waiter not found'); sys.exit(1)
-              fn = m.group(0)
-              mm = re.search(r'^(\s*)raw_spin_lock\(&[^\n]*pi_lock\);', fn, re.M)
-              if not mm:
-                  print('::error:: no pi_lock anchor in remove_waiter'); sys.exit(1)
-              ind = mm.group(1)
-              guard = ind + 'if (!waiter->task)\n' + ind + '\treturn;\n\n'
-              newfn = fn[:mm.start()] + guard + fn[mm.start():]
-              src = src[:m.start()] + newfn + src[m.end():]
-              open(p, 'w').write(src)
-              print('rtmutex fix2 guard inserted')
-          p2 = 'kernel/locking/rtmutex_api.c'
-          s2 = open(p2).read()
-          if 'if (unlikely(ret < 0))' in s2:
-              print('rtmutex fix2 proxy_lock already fixed')
-          else:
-              m2 = re.search(r'(?<!_)rt_mutex_start_proxy_lock\(.*?\n\}', s2, re.S)
-              if not m2:
-                  print('::error:: rt_mutex_start_proxy_lock not found'); sys.exit(1)
-              fn2 = m2.group(0)
-              if 'if (unlikely(ret))' not in fn2:
-                  print('::error:: unlikely(ret) anchor missing in proxy_lock'); sys.exit(1)
-              newfn2 = fn2.replace('if (unlikely(ret))', 'if (unlikely(ret < 0))', 1)
-              s2 = s2[:m2.start()] + newfn2 + s2[m2.end():]
-              open(p2, 'w').write(s2)
-              print('rtmutex fix2 proxy_lock fixed')
-          PYEOF
+          # Патч cctv18 содержит ОБЕ части фикса (GhostLock + регрессия). Проверяем все три признака:
+          grep -q "waiter_task = waiter->task" kernel/locking/rtmutex.c || { echo "::error:: rtmutex: waiter_task не найден"; exit 1; }
+          grep -q "if (!waiter_task)" kernel/locking/rtmutex.c || { echo "::error:: rtmutex: guard !waiter_task не найден"; exit 1; }
+          grep -q "if (unlikely(ret < 0))" kernel/locking/rtmutex_api.c || { echo "::error:: rtmutex: ret < 0 не найден"; exit 1; }
+          echo "rtmutex fix verified (waiter_task + guard + ret<0)"
 
       - name: Apply LZ4+ZSTD
         if: inputs.lz4zstd
@@ -316,7 +283,12 @@ jobs:
           if [[ "${{ inputs.bbr }}" == "true" ]]; then
             add "CONFIG_TCP_CONG_ADVANCED=y"
             add "CONFIG_TCP_CONG_CUBIC=y"
+            add "CONFIG_TCP_CONG_BBR=y"
             add "CONFIG_TCP_CONG_BBR3=y"
+            # =y вместо модулей: иначе Bazel падает на необъявленных .ko
+            add "CONFIG_TCP_CONG_HTCP=y"
+            add "CONFIG_TCP_CONG_BIC=y"
+            add "CONFIG_TCP_CONG_WESTWOOD=y"
             add 'CONFIG_DEFAULT_TCP_CONG="cubic"'
           fi
 
@@ -351,7 +323,6 @@ jobs:
 
       - name: Build kernel
         run: |
-          # Показывать полный вывод упавших действий Bazel (иначе ошибку компиляции не видно)
           echo "common --verbose_failures" >> $HOME/.bazelrc
           cd kernel_workspace
           export KSU_VERSION=${{ env.KSUVER }}
@@ -392,6 +363,8 @@ jobs:
 
       - name: Download VPNHide companion
         if: inputs.vpnhide
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd $GITHUB_WORKSPACE
           (gh release download --repo okhsunrog/vpnhide --pattern '*builtin*.zip' --dir . || \
