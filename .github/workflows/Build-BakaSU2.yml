@@ -117,7 +117,7 @@ jobs:
           # BakaSU Kbuild требует .git рядом с исходником; в bazel-песочнице .git нет.
           # 1) отключаем проверку submodule, 2) добавляем fallback для версии
           sed -i 's|^LOCAL_GIT_EXISTS := .*|LOCAL_GIT_EXISTS := 1|' KernelSU/kernel/Kbuild
-          sed -i 's|rev-list --count HEAD)|rev-list --count HEAD 2>/dev/null || echo 0)|' KernelSU/kernel/Kbuild
+          sed -i 's#rev-list --count HEAD)#rev-list --count HEAD 2>/dev/null || echo 0)#' KernelSU/kernel/Kbuild
           grep -q "LOCAL_GIT_EXISTS := 1" KernelSU/kernel/Kbuild || { echo "::error:: Kbuild submodule-check patch failed"; exit 1; }
           grep -q "rev-list --count HEAD 2>/dev/null" KernelSU/kernel/Kbuild || { echo "::error:: Kbuild version fallback patch failed"; exit 1; }
           echo "BakaSU Kbuild patched for bazel sandbox"
