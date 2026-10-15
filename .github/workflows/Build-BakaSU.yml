@@ -254,8 +254,8 @@ jobs:
           cd kernel_workspace/kernel_platform
           DEFCFG=./common/arch/arm64/configs/gki_defconfig
           VENDOR_CFG=./msm-kernel/arch/arm64/configs/vendor/pineapple_GKI.config
+          MSMK_CFG=./msm-kernel/arch/arm64/configs/gki_defconfig
           add_cfg() { grep -qx "$1" "$DEFCFG" || echo "$1" >> "$DEFCFG"; }
-          add_vendor() { grep -qx "$1" "$VENDOR_CFG" || echo "$1" >> "$VENDOR_CFG"; }
 
           add_cfg "CONFIG_KSU=y"
           add_cfg "CONFIG_KSU_SUSFS=y"
@@ -302,32 +302,23 @@ jobs:
             add_cfg "CONFIG_VPNHIDE=y"
           fi
 
-          # BBG: добавляем CONFIG_BBG и baseband_guard в CONFIG_LSM
-          if [ -e common/security/baseband-guard ] && grep -rqs "config BBG" common/security/; then
+          # BBG: проверяем по прямому пути Kconfig (grep -r не ходит в симлинки),
+          # CONFIG_LSM с baseband_guard пишем во все конфиги сборки
+          if [ -e common/security/baseband-guard/Kconfig ] && grep -qs "config BBG" common/security/baseband-guard/Kconfig; then
             add_cfg "CONFIG_BBG=y"
             LSM_VAL='landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,bpf,baseband_guard'
-            # gki_defconfig
-            if grep -q '^CONFIG_LSM=' "$DEFCFG"; then
-              if ! grep -q 'baseband_guard' "$DEFCFG"; then
-                sed -i 's/^\(CONFIG_LSM="[^"]*\)"$/\1,baseband_guard"/' "$DEFCFG"
-                echo "BBG appended to gki_defconfig CONFIG_LSM"
-              fi
-            else
-              add_cfg "CONFIG_LSM=\"${LSM_VAL}\""
-              echo "BBG CONFIG_LSM added to gki_defconfig"
-            fi
-            # vendor fragment (перекрывает gki_defconfig при merge)
-            if [ -f "$VENDOR_CFG" ]; then
-              if grep -q '^CONFIG_LSM=' "$VENDOR_CFG"; then
-                if ! grep -q 'baseband_guard' "$VENDOR_CFG"; then
-                  sed -i 's/^\(CONFIG_LSM="[^"]*\)"$/\1,baseband_guard"/' "$VENDOR_CFG"
-                  echo "BBG appended to vendor CONFIG_LSM"
+            for CFG in "$DEFCFG" "$VENDOR_CFG" "$MSMK_CFG"; do
+              [ -f "$CFG" ] || continue
+              if grep -q '^CONFIG_LSM=' "$CFG"; then
+                if ! grep -q 'baseband_guard' "$CFG"; then
+                  sed -i 's/^\(CONFIG_LSM="[^"]*\)"$/\1,baseband_guard"/' "$CFG"
+                  echo "BBG appended to $CFG"
                 fi
               else
-                add_vendor "CONFIG_LSM=\"${LSM_VAL}\""
-                echo "BBG CONFIG_LSM added to vendor fragment"
+                grep -qx "CONFIG_LSM=\"${LSM_VAL}\"" "$CFG" || echo "CONFIG_LSM=\"${LSM_VAL}\"" >> "$CFG"
+                echo "BBG CONFIG_LSM added to $CFG"
               fi
-            fi
+            done
           else
             echo "::warning:: BBG not integrated, skipping"
           fi
